@@ -142,6 +142,12 @@ class RequestTracker:
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
 
+    # Which of vLLM's KV cache groups these block ids belong to. Under the
+    # hybrid memory allocator a request carries one block-id list per group,
+    # and only the attention group's list indexes the tensors LMCache
+    # registered -- see `LMCacheConnectorV1Impl._kv_cache_group_id`.
+    kv_cache_group_id: int = 0
+
     @_lmcache_nvtx_annotate
     @staticmethod
     def from_new_request(
@@ -150,6 +156,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        kv_cache_group_id: int = 0,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -163,6 +170,9 @@ class RequestTracker:
                 cached in LMCache.
             request_priority (int): the priority of the request
             skip_save (bool): whether the request cache should be saved
+            kv_cache_group_id (int): index of the KV cache group whose blocks
+                LMCache manages. 0 on every non-hybrid model, where there is
+                only one group.
         """
         # vLLM 0.9.0 update: request.block_ids changed from list[int] to
         # tuple[list[int]]
@@ -173,15 +183,19 @@ class RequestTracker:
         if not isinstance(new_request.block_ids[0], list):
             unfolded_block_ids = new_request.block_ids.copy()
         else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+            # One list per vLLM KV cache group. LMCache tracks exactly one
+            # group -- the one whose tensors it registered -- so take that
+            # group's blocks and leave the rest to whoever owns them.
+            #
+            # This used to be hardcoded to group 0, which is correct only
+            # because a dense model has a single group. Under the hybrid
+            # memory allocator (Mamba/linear + attention) the groups share one
+            # block-id space but each indexes its *own* tensors, so group 0's
+            # ids point into a recurrent-state group's pages: every slot
+            # mapping computed from them addresses unrelated memory. Saves
+            # write another request's blocks, loads read them back -- no error,
+            # just wrong tokens.
+            unfolded_block_ids = new_request.block_ids[kv_cache_group_id].copy()
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -202,6 +216,7 @@ class RequestTracker:
             skip_save=skip_save,
             request_configs=request_configs,
             num_lmcache_cached_tokens=lmcache_cached_tokens,
+            kv_cache_group_id=kv_cache_group_id,
         )
 
     def update(
@@ -230,7 +245,8 @@ class RequestTracker:
         elif len(new_block_ids) == 0:
             new_block_ids = []
         elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
+            # Per-group tuple; keep the group this tracker was built for.
+            new_block_ids = new_block_ids[self.kv_cache_group_id]
         elif isinstance(new_block_ids, list):
             # If input is a list, flatten it to handle potential nesting.
             # This also correctly processes already-flat lists.
@@ -458,6 +474,20 @@ class LMCacheConnectorV1Impl:
         self._parent = parent
         self._vllm_config = vllm_config
         self._role = role
+
+        # vLLM hands a request one block-id list per KV cache group. LMCache
+        # only ever registers, and can only represent, the attention group's
+        # tensors, so every block id it uses must come from that group. The
+        # connector knows which one that is (on a hybrid model it is not
+        # group 0); anything that does not tell us is single-group by
+        # definition.
+        self._kv_cache_group_id = getattr(parent, "attn_kv_cache_group_id", 0)
+        if self._kv_cache_group_id:
+            logger.info(
+                "LMCache: tracking vLLM KV cache group %d (hybrid model)",
+                self._kv_cache_group_id,
+            )
+
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.worker_count = vllm_config.parallel_config.tensor_parallel_size
@@ -732,7 +762,75 @@ class LMCacheConnectorV1Impl:
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
+        self._align_layout_with_registered_caches(kv_caches)
         self._manager.post_init()
+
+    def _align_layout_with_registered_caches(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Make LMCache's KV layout agree with what was actually registered.
+
+        ``LMCacheMetadata.kv_shape[0]`` is seeded from
+        ``model_config.get_num_layers()`` -- *every* layer in the model. A
+        serving engine may register fewer: on a hybrid attention + mamba model
+        the recurrent-state layers are handed to connectors as an opaque
+        ``[num_blocks, 1, 1, page_size_bytes]`` byte view that LMCache has no
+        format for, so vLLM's connector registers only the attention group.
+
+        The mismatch is not benign. It surfaces immediately as
+
+            ValueError: could not broadcast input array from shape (29,)
+            into shape (98,)
+
+        in ``VLLMPagedMemGPUConnectorV2._initialize_pointers``, and it would
+        otherwise size every chunk buffer (``metadata.get_shapes()``) for more
+        layers than the transfer kernel is given pointers for.
+
+        ``VLLMPagedMemGPUConnectorV3`` already derives per-group layer counts
+        from the registered tensors via ``KVLayerGroupsManager`` -- but lazily,
+        on the first transfer, which is *after* ``LMCacheEngine.store`` has
+        allocated its memory objects from the metadata. Build it here, while
+        the registered set is in hand, so every consumer agrees with the
+        tensors.
+        """
+        engine = self.lmcache_engine
+        if engine is None or engine.metadata is None:
+            return
+        metadata = engine.metadata
+        num_registered = len(kv_caches)
+        if num_registered == metadata.kv_shape[0]:
+            return
+
+        gpu_connector = getattr(engine, "gpu_connector", None)
+        build_groups = getattr(gpu_connector, "_initialize_kv_cache_pointers", None)
+        if build_groups is None:
+            raise ValueError(
+                f"LMCache was configured for {metadata.kv_shape[0]} layers but "
+                f"the serving engine registered {num_registered}. "
+                f"{type(gpu_connector).__name__} takes its layer count from the "
+                "model config, so it cannot serve a subset. Set "
+                "LMCACHE_USE_GPU_CONNECTOR_V3=True: "
+                "VLLMPagedMemGPUConnectorV3 derives its layout, including "
+                "per-group layer counts, from the registered tensors."
+            )
+
+        gpu_connector.initialize_kvcaches_ptr(kvcaches=list(kv_caches.values()))
+        build_groups()
+
+        klg_manager = metadata.kv_layer_groups_manager
+        assert klg_manager is not None
+        num_grouped = sum(group.num_layers for group in klg_manager.kv_layer_groups)
+        logger.info(
+            "Registered %d of the model's %d layers; rebuilding the KV layout "
+            "around them: %d group(s), %d layer(s) total.",
+            num_registered,
+            metadata.kv_shape[0],
+            len(klg_manager.kv_layer_groups),
+            num_grouped,
+        )
+        metadata.kv_shape = (num_grouped,) + tuple(metadata.kv_shape[1:])
+        # `use_layerwise` counts down to the last layer with this.
+        self.num_layers = num_grouped
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -1394,6 +1492,20 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
+        # Hybrid (Mamba/linear + attention) models: a paged-KV prefix is only
+        # restorable at a boundary where the per-request recurrent state can be
+        # restored too. LMCache carries no state format, so the parent connector
+        # owns that tier and clamps us to the largest boundary it can serve.
+        # Restoring attention KV over recurrent state that never saw those
+        # tokens is silent wrong output, so the clamp has to happen here rather
+        # than on the value the parent returns to vLLM: `update_state_after_alloc`
+        # asserts that the scheduler accepted exactly what was reported.
+        clamp = getattr(self._parent, "clamp_external_hit", None)
+        if clamp is not None:
+            num_external_hit_tokens = clamp(
+                request, num_computed_tokens, num_external_hit_tokens
+            )
+
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
@@ -1574,6 +1686,7 @@ class LMCacheConnectorV1Impl:
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                kv_cache_group_id=self._kv_cache_group_id,
             )
             self._request_trackers[request.req_id] = request_tracker
 
